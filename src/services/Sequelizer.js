@@ -119,9 +119,146 @@ class Sequelizer {
       });
   }
 
+  async getChildFieldNames(tableName, sysparm_fields = "") {
+    const requestedFields = String(sysparm_fields || "")
+      .split(",")
+      .map((field) => field.trim())
+      .filter(Boolean);
+
+    const allFields = (await this.sysDictionary.getAttribs(tableName))?.rows || [];
+    const childFieldNames = [...new Set(
+      allFields
+        .filter((field) => field.name === tableName && !field.inherited && field.element)
+        .map((field) => field.element)
+    )];
+
+    if (!requestedFields.length) return childFieldNames;
+    return requestedFields.filter((field) => childFieldNames.includes(field));
+  }
+
+  async getParentFieldNames(tableName) {
+    const superClass = await this.sysDbObject.getSuperClass(tableName);
+    if (!superClass) return [];
+
+    const parentFields = (await this.sysDictionary.getAttribs(superClass))?.rows || [];
+    return [...new Set(
+      parentFields
+        .filter((field) => field.name === superClass && !field.inherited && field.element)
+        .map((field) => field.element)
+    )];
+  }
+
+  async consolidateParentChildRows(tableName, rows = []) {
+    if (!Array.isArray(rows) || rows.length === 0) return rows;
+
+    const superClass = await this.sysDbObject.getSuperClass(tableName);
+    if (!superClass) return rows;
+
+    const ParentModel = await this.getTableMapping(superClass);
+    const sysIds = rows
+      .map((row) => row.sys_id ?? row.dataValues?.sys_id)
+      .filter(Boolean);
+
+    if (!sysIds.length) return rows;
+
+    const parentRows = await ParentModel.findAll({
+      where: { sys_id: sysIds },
+      attributes: await this.getParentFieldNames(tableName),
+    });
+
+    const parentMap = new Map(
+      (parentRows || []).map((row) => {
+        const data = row.toJSON ? row.toJSON() : row;
+        return [String(data.sys_id), data];
+      })
+    );
+
+    return rows.map((row) => {
+      const child = row.toJSON ? row.toJSON() : row;
+      const parent = parentMap.get(String(child.sys_id));
+      return parent ? { ...parent, ...child } : child;
+    });
+  }
+
   /** RECORD operations
    * @param {Object} req request object must contain table_name in params
    */
+  async getTableColumnNames(tableName) {
+    try {
+      const tableDefinition = await this.sequelize.getQueryInterface().describeTable(tableName);
+      return Object.keys(tableDefinition || {});
+    } catch (error) {
+      return [];
+    }
+  }
+
+  async sanitizePayloadForTable(tableName, data = {}) {
+    const allowedColumns = new Set(await this.getTableColumnNames(tableName));
+    const sanitized = {};
+
+    for (const [key, value] of Object.entries(data || {})) {
+      if (value === undefined) continue;
+      if (allowedColumns.has(key)) {
+        sanitized[key] = value;
+      }
+    }
+
+    return sanitized;
+  }
+
+  async splitParentChildData(tableName, data = {}) {
+    const superClass = await this.sysDbObject.getSuperClass(tableName);
+    const childTableColumns = await this.getTableColumnNames(tableName);
+
+    if (!superClass) {
+      return {
+        parentData: { ...data },
+        childData: { ...data },
+      };
+    }
+
+    const parentFields = new Set((await this.getParentFieldNames(tableName)).map((field) => String(field)));
+    const childFields = new Set((await this.getChildFieldNames(tableName)).map((field) => String(field)));
+
+    const parentData = {};
+    const childData = {};
+
+    for (const [key, value] of Object.entries(data || {})) {
+      if (value === undefined) continue;
+
+      const fieldName = String(key);
+      const isSystemField = fieldName.startsWith("sys_");
+      const childHasColumn = childTableColumns.includes(fieldName);
+
+      if (superClass && isSystemField && !childHasColumn) {
+        parentData[key] = value;
+        continue;
+      }
+
+      if (isSystemField && childHasColumn) {
+        parentData[key] = value;
+        childData[key] = value;
+        continue;
+      }
+
+      if (parentFields.has(fieldName) && !childFields.has(fieldName)) {
+        parentData[key] = value;
+        continue;
+      }
+
+      if (childFields.has(fieldName) || (!parentFields.has(fieldName) && !isSystemField)) {
+        childData[key] = value;
+      }
+    }
+
+    if (data.sys_id !== undefined) {
+      parentData.sys_id = data.sys_id;
+      childData.sys_id = data.sys_id;
+    }
+
+    return { parentData, childData };
+  }
+
   async getRows(req) {
     const { table_name } = req.params;
     const { sys_id, sysparm_query, sysparm_limit, sysparm_fields } = req.query;
@@ -139,14 +276,12 @@ class Sequelizer {
         console.log("[Sequlizer::getRows] Filtered Query: %o", query);
       }
 
-      // If sysparm_fields is provided, use it as the attributes option
-      if (sysparm_fields) {
-        query.attributes = sysparm_fields.split(",").map(f => f.trim()).filter(Boolean);
-      }
+      query.attributes = await this.getChildFieldNames(table_name, sysparm_fields);
 
       return await Model.findAll(query)
-        .then((result) => {
-          return { data: result, status: "success" };
+        .then(async (result) => {
+          const consolidated = await this.consolidateParentChildRows(table_name, result);
+          return { data: consolidated, status: "success" };
         })
         .catch((e) => {
           console.error("[Sequlizer::getRows] Get rows error : ", e);
@@ -221,7 +356,46 @@ class Sequelizer {
 
   async handleRecord(req) {
     let { sys_id } = req.query;
-    sys_id = utils.nil(sys_id) ? req.body.sys_id : sys_id; //either from body or query
+
+    // Debug: log incoming sys_id shapes when unexpected errors occur
+    try {
+      console.debug("[SEQUELIZER::handleRecord] incoming req.query.sys_id type=%s value=%o", typeof req.query.sys_id, req.query.sys_id);
+    } catch (e) {
+      // ignore debug errors
+    }
+
+    // Normalize cases where sys_id is sent as an object via query string
+    if (sys_id && typeof sys_id === "object") {
+      // If the nested object contains a scalar sys_id, prefer that
+      if (sys_id.sys_id) {
+        let scalar = sys_id.sys_id;
+        if (Array.isArray(scalar)) scalar = scalar[0];
+        if (typeof scalar === 'object') scalar = String(scalar);
+        req.body.sys_id = req.body.sys_id || scalar;
+        sys_id = scalar;
+      } else {
+        // Merge any provided query fields into the body (e.g. sys_id[name]=...)
+        req.body = { ...sys_id, ...req.body };
+        // Coerce any merged sys_id to scalar if present
+        let merged = req.body.sys_id || null;
+        if (merged && Array.isArray(merged)) merged = merged[0];
+        if (merged && typeof merged === 'object') merged = String(merged);
+        if (merged) {
+          req.body.sys_id = merged;
+          sys_id = merged;
+        } else {
+          // No scalar sys_id found; leave sys_id as undefined so insert path is chosen
+          sys_id = req.body.sys_id || undefined;
+        }
+      }
+    } else {
+      sys_id = utils.nil(sys_id) ? req.body.sys_id : sys_id; //either from body or query
+      if (!utils.nil(sys_id) && !req.body.sys_id) req.body.sys_id = sys_id;
+    }
+
+    try {
+      console.debug("[SEQUELIZER::handleRecord] normalized sys_id type=%s value=%o", typeof sys_id, sys_id);
+    } catch (e) {}
 
     // if sys_id=-1 then create new record
     if (utils.nil(sys_id) || sys_id === "-1") {
@@ -239,71 +413,98 @@ class Sequelizer {
    */
   async insertRow(req) {
     const { table_name } = req.params;
+    const superClass = await this.sysDbObject.getSuperClass(table_name);
+    const tableFields = await this.getTableColumnNames(table_name);
 
-    // unique 32-character sys_id
-    req.body.sys_id = utils.generateSysID();
+    req.body.sys_id = req.body.sys_id || utils.generateSysID();
 
-    // set default values for sys_ columns
-    req.body.sys_updated_by = req.body.sys_created_by = "system";
-    req.body.sys_updated_on = req.body.sys_created_on =
-      this.sequelize.fn("NOW");
+    req.body.sys_created_by = req.body.sys_created_by || "system";
+    req.body.sys_updated_by = req.body.sys_updated_by || "system";
 
-    // Find the display field from sys_dictionary
+    if (tableFields.includes("sys_updated_on")) req.body.sys_updated_on = this.sequelize.fn("NOW");
+    if (tableFields.includes("sys_created_on")) req.body.sys_created_on = this.sequelize.fn("NOW");
+
     const displayField = await this.sysDictionary.findOne({
       where: {
         name: table_name,
-        display: true
+        display: true,
       }
     });
 
-    // Set sys_name based on display field if available, otherwise fallback to name field
-    req.body.sys_name = displayField ? req.body[displayField.element] : req.body.name;
-    req.body.sys_mod_count = "0";
-    req.body.sys_update_name = `${table_name}_${req.body.sys_id}`;
-    req.body.sys_class_name = table_name; // Set sys_class_name to table name by default
+    if (tableFields.includes("sys_name")) {
+      req.body.sys_name = req.body.sys_name || (displayField ? req.body[displayField.element] : req.body.name);
+    }
 
-    // Get speccific or generic Model
+    if (superClass || tableFields.includes("sys_mod_count")) {
+      req.body.sys_mod_count = req.body.sys_mod_count || "0";
+    }
+    if (tableFields.includes("sys_update_name")) req.body.sys_update_name = `${table_name}_${req.body.sys_id}`;
+    if (tableFields.includes("sys_class_name")) req.body.sys_class_name = table_name;
+
+    const { parentData, childData } = await this.splitParentChildData(table_name, req.body);
     const Model = await this.getTableMapping(table_name);
 
-    // Insert the new row
-    return await Model.create(req.body)
-      .then((result) => {
-        if (!utils.nil(result))
-          return { sys_id: result.dataValues.sys_id, status: "success" };
-      })
-      .catch((e) => {
-        console.error("[SEQUELIZER::insertRow] Insert row error : ", e);
-        return { sys_id: "", status: "fail", err: e };
-      });
+    try {
+      if (superClass) {
+        const ParentModel = await this.getTableMapping(superClass);
+        const validParentData = await this.sanitizePayloadForTable(superClass, parentData);
+        if (Object.keys(validParentData).length) {
+          await ParentModel.create(validParentData);
+        }
+      }
+
+      const validChildData = await this.sanitizePayloadForTable(table_name, childData);
+      const result = await Model.create(validChildData);
+      return { sys_id: result.dataValues.sys_id, status: "success" };
+    } catch (e) {
+      console.error("[SEQUELIZER::insertRow] Insert row error : ", e);
+      return { sys_id: "", status: "fail", err: e };
+    }
   }
 
   async updateRow(req) {
     const { table_name } = req.params;
     const { sys_id } = req.body;
+    const superClass = await this.sysDbObject.getSuperClass(table_name);
 
-    // Get speccific or generic Model
     const Model = await this.getTableMapping(table_name);
-
     const instance = await Model.findByPk(sys_id);
     if (!instance)
       return { sys_id: "", status: "fail", err: "Record not found" };
 
-    req.body.sys_updated_on = this.sequelize.fn("NOW");
-    delete req.body.sys_created_on;
+    const childTableColumns = await this.getTableColumnNames(table_name);
+    if (childTableColumns.includes("sys_updated_on")) {
+      req.body.sys_updated_on = this.sequelize.fn("NOW");
+    }
+    if (childTableColumns.includes("sys_created_on")) {
+      delete req.body.sys_created_on;
+    }
 
-    return await Model.update(req.body, {
-      where: {
-        sys_id: sys_id,
-      },
-      individualHooks: true,
-    })
-      .then(() => {
-        return { sys_id: sys_id, status: "success" };
-      })
-      .catch((e) => {
-        console.error("[SEQUELIZER::updateRow] Update row error : ", e);
-        return { sys_id: sys_id, status: "fail", err: e };
+    const { parentData, childData } = await this.splitParentChildData(table_name, req.body);
+
+    try {
+      if (superClass) {
+        const ParentModel = await this.getTableMapping(superClass);
+        const validParentData = await this.sanitizePayloadForTable(superClass, parentData);
+        if (Object.keys(validParentData).length) {
+          await ParentModel.update(validParentData, {
+            where: { sys_id },
+            individualHooks: true,
+          });
+        }
+      }
+
+      const validChildData = await this.sanitizePayloadForTable(table_name, childData);
+      await Model.update(validChildData, {
+        where: { sys_id },
+        individualHooks: true,
       });
+
+      return { sys_id: sys_id, status: "success" };
+    } catch (e) {
+      console.error("[SEQUELIZER::updateRow] Update row error : ", e);
+      return { sys_id: sys_id, status: "fail", err: e };
+    }
   }
 
   async deleteRow(req) {
@@ -359,10 +560,22 @@ async getTableMapping(tableName) {
   };
 
   let Model = table_map[tableName];
-  if (!Model) {
+    if (!Model) {
     // Dynamically define the model if it doesn't exist in the table_map
     const { data } = await this.getColumns(tableName);
-    Model = this.sequelize.define(tableName, data);
+    const columns = data || {};
+    const hasSysCreated = Object.prototype.hasOwnProperty.call(columns, "sys_created_on");
+    const hasSysUpdated = Object.prototype.hasOwnProperty.call(columns, "sys_updated_on");
+    const useTimestamps = hasSysCreated && hasSysUpdated;
+
+    Model = this.sequelize.define(tableName, columns, {
+      tableName: tableName,
+      modelName: tableName,
+      freezeTableName: true,
+      timestamps: useTimestamps,
+      createdAt: useTimestamps ? "sys_created_on" : false,
+      updatedAt: useTimestamps ? "sys_updated_on" : false,
+    });
   }
 
   return Model;

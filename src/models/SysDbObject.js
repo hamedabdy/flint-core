@@ -84,7 +84,8 @@ module.exports = (sequelize, parent) => {
         await this.sysDictionary.createCollection(data, options);
         
         // If super_class is specified, copy fields from parent table otherwise, use base model fields
-        await this.sysDictionary._copyParentFields(data.name, data.super_class);
+        // await this.sysDictionary._copyParentFields(data.name, data.super_class);
+        // DO NOT COPY PARENT FIELDS. USE PARENT FIELDS IN CHILD TABLES !
       }
 
       return new Promise((resolve, reject) => {
