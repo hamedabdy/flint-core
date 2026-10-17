@@ -148,6 +148,21 @@ class Sequelizer {
     )];
   }
 
+  async getAvailableFieldNames(tableName) {
+    const fieldNames = new Set();
+    const visitedTables = new Set();
+    let currentTable = tableName;
+
+    while (currentTable && !visitedTables.has(currentTable)) {
+      visitedTables.add(currentTable);
+      const columns = await this.getTableColumnNames(currentTable);
+      columns.forEach((column) => fieldNames.add(column));
+      currentTable = await this.sysDbObject.getSuperClass(currentTable);
+    }
+
+    return [...fieldNames];
+  }
+
   async consolidateParentChildRows(tableName, rows = []) {
     if (!Array.isArray(rows) || rows.length === 0) return rows;
 
@@ -304,8 +319,31 @@ class Sequelizer {
       let displayField = await this.sysDictionary.getDisplayField(tableName);
       const hasSysName = await this.sysDictionary.isValidField(tableName, 'sys_name');
       displayField = displayField || (hasSysName ? "sys_name" : "sys_created_on"); // Fallback to sys_created_on if no display field or sys_name exists
-      const Model = await this.getTableMapping(tableName);
-      const where = { [reference_key || 'sys_id']: value };
+      const referenceKey = reference_key || 'sys_id';
+      const availableFields = await this.getAvailableFieldNames(tableName);
+      if (!availableFields.includes(displayField)) {
+        return { data: null, status: 'fail', err: `Display field ${displayField} is not available on ${tableName} or its parents` };
+      }
+
+      let sourceTable = null;
+      let currentTable = tableName;
+      const visitedTables = new Set();
+      while (currentTable && !visitedTables.has(currentTable)) {
+        visitedTables.add(currentTable);
+        const columns = await this.getTableColumnNames(currentTable);
+        if (columns.includes(displayField) && columns.includes(referenceKey)) {
+          sourceTable = currentTable;
+          break;
+        }
+        currentTable = await this.sysDbObject.getSuperClass(currentTable);
+      }
+
+      if (!sourceTable) {
+        return { data: null, status: 'fail', err: `No table in the ${tableName} hierarchy contains ${displayField} and ${referenceKey}` };
+      }
+
+      const Model = await this.getTableMapping(sourceTable);
+      const where = { [referenceKey]: value };
       const attributes = [displayField];
       const result = await Model.findOne({ where, attributes });
       if (result)
