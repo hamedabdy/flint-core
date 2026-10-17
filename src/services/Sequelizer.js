@@ -454,7 +454,9 @@ class Sequelizer {
     const superClass = await this.sysDbObject.getSuperClass(table_name);
     const tableFields = await this.getTableColumnNames(table_name);
 
-    req.body.sys_id = req.body.sys_id || utils.generateSysID();
+    if (utils.nil(req.body.sys_id) || String(req.body.sys_id) === "-1") {
+      req.body.sys_id = utils.generateSysID();
+    }
 
     req.body.sys_created_by = req.body.sys_created_by || "system";
     req.body.sys_updated_by = req.body.sys_updated_by || "system";
