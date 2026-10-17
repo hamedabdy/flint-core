@@ -482,9 +482,10 @@ class Sequelizer {
 
     const { parentData, childData } = await this.splitParentChildData(table_name, req.body);
     const Model = await this.getTableMapping(table_name);
+    const modelCreatesParent = Model === this.sysDbObject || Model === this.sysDictionary;
 
     try {
-      if (superClass) {
+      if (superClass && !modelCreatesParent) {
         const ParentModel = await this.getTableMapping(superClass);
         const validParentData = await this.sanitizePayloadForTable(superClass, parentData);
         if (Object.keys(validParentData).length) {

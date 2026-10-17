@@ -301,7 +301,7 @@ module.exports = (sequelize, parent) => {
           await this._createColumnsInChildTables(data.name, data, options);
         }
 
-        parent.create(data, options); // Create a new record in sys_metadata
+        await parent.create(data, options); // Create a new record in sys_metadata
         // Insert the new row in table
         const record = await super.create(data, options);
         return record;
