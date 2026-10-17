@@ -431,15 +431,14 @@ class Sequelizer {
       }
     });
 
-    if (tableFields.includes("sys_name")) {
+    if (tableFields.includes("sys_name"))
       req.body.sys_name = req.body.sys_name || (displayField ? req.body[displayField.element] : req.body.name);
-    }
 
-    if (superClass || tableFields.includes("sys_mod_count")) {
+    if (superClass || tableFields.includes("sys_mod_count"))
       req.body.sys_mod_count = req.body.sys_mod_count || "0";
-    }
+    
     if (tableFields.includes("sys_update_name")) req.body.sys_update_name = `${table_name}_${req.body.sys_id}`;
-    if (tableFields.includes("sys_class_name")) req.body.sys_class_name = table_name;
+    if (superClass || tableFields.includes("sys_class_name")) req.body.sys_class_name = table_name;
 
     const { parentData, childData } = await this.splitParentChildData(table_name, req.body);
     const Model = await this.getTableMapping(table_name);
